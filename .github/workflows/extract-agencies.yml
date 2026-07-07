@@ -1,0 +1,136 @@
+name: Extraction agences immobilières indépendantes
+
+on:
+  workflow_dispatch: {}        # permet de lancer le workflow manuellement depuis l'onglet Actions
+  schedule:
+    - cron: "0 6 1 * *"        # exemple : tous les 1er du mois à 6h UTC (à adapter ou supprimer)
+
+jobs:
+  # -------------------------------------------------------------------------
+  # 1) Calcule la répartition des départements entre les shards
+  # -------------------------------------------------------------------------
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.compute.outputs.matrix }}
+    steps:
+      - name: Calcul des lots de départements
+        id: compute
+        shell: python
+        run: |
+          import json
+
+          deps = [str(i).zfill(2) for i in range(1, 96)]
+          deps += ["971", "972", "973", "974", "976"]
+
+          NB_SHARDS = 10
+          shards = [deps[i::NB_SHARDS] for i in range(NB_SHARDS)]
+
+          matrix = {
+              "include": [
+                  {"shard": i, "departments": ",".join(shard)}
+                  for i, shard in enumerate(shards)
+              ]
+          }
+
+          with open("${GITHUB_OUTPUT}", "a") as f:
+              f.write(f"matrix={json.dumps(matrix)}\n")
+
+  # -------------------------------------------------------------------------
+  # 2) Exécute l'extraction en parallèle, un job par shard de départements
+  # -------------------------------------------------------------------------
+  extract:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+
+    steps:
+      - name: Checkout du dépôt
+        uses: actions/checkout@v4
+
+      - name: Configuration de Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Installation des dépendances
+        run: pip install requests
+
+      - name: Extraction du shard ${{ matrix.shard }}
+        run: |
+          python extract_agencies.py \
+            --departments "${{ matrix.departments }}" \
+            --output "agences_shard_${{ matrix.shard }}.csv"
+
+      - name: Publication du shard en artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: agences-shard-${{ matrix.shard }}
+          path: agences_shard_${{ matrix.shard }}.csv
+          retention-days: 5
+
+  # -------------------------------------------------------------------------
+  # 3) Fusionne tous les shards en un seul CSV final
+  # -------------------------------------------------------------------------
+  merge:
+    needs: extract
+    runs-on: ubuntu-latest
+    steps:
+      - name: Téléchargement de tous les shards
+        uses: actions/download-artifact@v4
+        with:
+          pattern: agences-shard-*
+          path: shards
+          merge-multiple: true
+
+      - name: Fusion des CSV
+        shell: python
+        run: |
+          import csv
+          import glob
+
+          fieldnames = ["Nom", "Ville", "Code Postal", "Adresse", "SIRET", "Date Creation"]
+          rows = []
+
+          for path in sorted(glob.glob("shards/*.csv")):
+              with open(path, newline="", encoding="utf-8") as f:
+                  reader = csv.DictReader(f)
+                  rows.extend(reader)
+
+          # Dédoublonnage par SIRET, au cas où
+          seen = set()
+          unique_rows = []
+          for row in rows:
+              siret = row.get("SIRET")
+              if siret in seen:
+                  continue
+              seen.add(siret)
+              unique_rows.append(row)
+
+          with open("agences_independantes_france.csv", "w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=fieldnames)
+              writer.writeheader()
+              writer.writerows(unique_rows)
+
+          print(f"Fusion terminée : {len(unique_rows)} agences uniques sur {len(rows)} lignes au total.")
+
+      - name: Publication du CSV final
+        uses: actions/upload-artifact@v4
+        with:
+          name: agences_independantes_france
+          path: agences_independantes_france.csv
+          retention-days: 30
+
+      # Optionnel : committer directement le CSV final dans le dépôt
+      # Nécessite "permissions: contents: write" sur ce job pour fonctionner
+      # - name: Commit du CSV dans le dépôt
+      #   run: |
+      #     git config user.name "github-actions[bot]"
+      #     git config user.email "github-actions[bot]@users.noreply.github.com"
+      #     git add agences_independantes_france.csv
+      #     git commit -m "Mise à jour automatique des agences indépendantes" || echo "Rien à committer"
+      #     git push
+      
